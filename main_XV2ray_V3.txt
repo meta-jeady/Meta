@@ -1,0 +1,1545 @@
+import 'dart:convert';
+import 'dart:math';
+import 'package:flutter/material.dart';
+import 'package:flutter/services.dart';
+import 'package:flutter_v2ray/flutter_v2ray.dart';
+import 'package:shared_preferences/shared_preferences.dart';
+
+void main() {
+  WidgetsFlutterBinding.ensureInitialized();
+  SystemChrome.setPreferredOrientations([
+    DeviceOrientation.portraitUp,
+    DeviceOrientation.portraitDown,
+  ]);
+  runApp(const XV2rayApp());
+}
+
+class XV2rayApp extends StatelessWidget {
+  const XV2rayApp({super.key});
+
+  @override
+  Widget build(BuildContext context) {
+    return MaterialApp(
+      title: 'XV2ray',
+      debugShowCheckedModeBanner: false,
+      theme: ThemeData(
+        useMaterial3: true,
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: const Color(0xFF0B1120),
+        colorScheme: ColorScheme.fromSeed(
+          seedColor: const Color(0xFF0EA5E9),
+          brightness: Brightness.dark,
+          primary: const Color(0xFF0EA5E9),
+          secondary: const Color(0xFF22C55E),
+        ),
+        snackBarTheme: SnackBarThemeData(
+          behavior: SnackBarBehavior.floating,
+          backgroundColor: const Color(0xFF1E293B),
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+          contentTextStyle: const TextStyle(color: Colors.white),
+        ),
+      ),
+      home: const HomeScreen(),
+    );
+  }
+}
+
+// ========== Obfuscation des liens (non lisible) ==========
+String _obfuscate(String plain) {
+  const int key = 0x5A;
+  final bytes = utf8.encode(plain);
+  final xored = bytes.map((b) => b ^ key).toList();
+  return base64Url.encode(xored);
+}
+
+String _deobfuscate(String encoded) {
+  const int key = 0x5A;
+  final xored = base64Url.decode(encoded);
+  final bytes = xored.map((b) => b ^ key).toList();
+  return utf8.decode(bytes);
+}
+
+class HomeScreen extends StatefulWidget {
+  const HomeScreen({super.key});
+
+  @override
+  State<HomeScreen> createState() => _HomeScreenState();
+}
+
+class _HomeScreenState extends State<HomeScreen> with TickerProviderStateMixin {
+  late FlutterV2ray v2ray;
+  late AnimationController _pulseController;
+  late AnimationController _rotateController;
+  late Animation<double> _pulseAnimation;
+
+  String statut = "DÉCONNECTÉ";
+  bool estConnecte = false;
+  bool enCours = false;
+  String modeSelectionne = "VLESS / VMess";
+  bool isLocked = false;
+
+  DateTime? connectedAt;
+  String connectionTime = "00:00";
+
+  String? lockedHost;
+  String? lockedConfig;
+  String? lockedName;
+
+  final List<String> modes = [
+    "VLESS / VMess",
+    "UDP",
+    "SlowDNS",
+    "SSH",
+    "Trojan",
+  ];
+
+  final TextEditingController hostCtrl = TextEditingController();
+  final TextEditingController configCtrl = TextEditingController();
+  final List<String> logs = [];
+
+  List<double> uploadPoints = [];
+  List<double> downloadPoints = [];
+  static const int maxGraphPoints = 60;
+  int uploadTotal = 0;
+  int downloadTotal = 0;
+  double currentUpSpeed = 0;
+  double currentDownSpeed = 0;
+  int lastUpSession = 0;
+  int lastDownSession = 0;
+
+  @override
+  void initState() {
+    super.initState();
+
+    _pulseController = AnimationController(
+      duration: const Duration(milliseconds: 1500),
+      vsync: this,
+    );
+    _pulseAnimation = Tween<double>(begin: 1.0, end: 1.15).animate(
+      CurvedAnimation(parent: _pulseController, curve: Curves.easeInOut),
+    );
+
+    _rotateController = AnimationController(
+      duration: const Duration(seconds: 2),
+      vsync: this,
+    );
+
+    Stream.periodic(const Duration(seconds: 1)).listen((_) {
+      if (estConnecte && connectedAt != null && mounted) {
+        final diff = DateTime.now().difference(connectedAt!);
+        setState(() {
+          connectionTime =
+              "${diff.inMinutes.toString().padLeft(2, '0')}:${(diff.inSeconds % 60).toString().padLeft(2, '0')}";
+        });
+      }
+    });
+
+    v2ray = FlutterV2ray(
+      onStatusChanged: (status) {
+        if (!mounted) return;
+        final state = status.state.toUpperCase();
+
+        setState(() {
+          if (state == "CONNECTED") {
+            final up = status.upload ?? 0;
+            final down = status.download ?? 0;
+
+            currentUpSpeed = (up - lastUpSession) / 1024.0;
+            currentDownSpeed = (down - lastDownSession) / 1024.0;
+            if (currentUpSpeed < 0) currentUpSpeed = 0;
+            if (currentDownSpeed < 0) currentDownSpeed = 0;
+
+            lastUpSession = up;
+            lastDownSession = down;
+
+            uploadTotal = up;
+            downloadTotal = down;
+
+            addDataPoint(uploadPoints, currentUpSpeed);
+            addDataPoint(downloadPoints, currentDownSpeed);
+            saveTrafficData();
+          }
+
+          if (state == "CONNECTED") {
+            if (statut != "FREE SERF") {
+              addLog("→ ready to use");
+              statut = "FREE SERF";
+              estConnecte = true;
+              enCours = false;
+              connectedAt = DateTime.now();
+              _pulseController.repeat(reverse: true);
+              _rotateController.stop();
+
+              showCustomSnack("Connected successfully", const Color(0xFF22C55E));
+            }
+          } else if (state == "CONNECTING") {
+            statut = "CONNEXION...";
+            enCours = true;
+            estConnecte = false;
+            _rotateController.repeat();
+          } else {
+            statut = "DÉCONNECTÉ";
+            estConnecte = false;
+            enCours = false;
+            currentUpSpeed = 0;
+            currentDownSpeed = 0;
+            connectedAt = null;
+            connectionTime = "00:00";
+            _pulseController.stop();
+            _rotateController.stop();
+            addDataPoint(uploadPoints, 0);
+            addDataPoint(downloadPoints, 0);
+          }
+        });
+      },
+    );
+    initCore();
+    loadLockedConfig();
+    loadTrafficData();
+  }
+
+  void showCustomSnack(String message, Color color) {
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            Icon(
+              color == const Color(0xFF22C55E) ? Icons.check_circle : Icons.error,
+              color: color,
+              size: 20,
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Text(
+                message,
+                style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: const Color(0xFF1E293B),
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.all(16),
+        duration: const Duration(seconds: 2),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(color: color.withOpacity(0.3), width: 1),
+        ),
+      ),
+    );
+  }
+
+  void addDataPoint(List<double> list, double value) {
+    setState(() {
+      list.add(value);
+      if (list.length > maxGraphPoints) {
+        list.removeAt(0);
+      }
+    });
+  }
+
+  Future<void> saveTrafficData() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setInt('uploadTotal', uploadTotal);
+    await prefs.setInt('downloadTotal', downloadTotal);
+    await prefs.setStringList(
+        'uploadPoints', uploadPoints.map((e) => e.toString()).toList());
+    await prefs.setStringList(
+        'downloadPoints', downloadPoints.map((e) => e.toString()).toList());
+  }
+
+  Future<void> loadTrafficData() async {
+    final prefs = await SharedPreferences.getInstance();
+    setState(() {
+      uploadTotal = prefs.getInt('uploadTotal') ?? 0;
+      downloadTotal = prefs.getInt('downloadTotal') ?? 0;
+      uploadPoints = (prefs.getStringList('uploadPoints') ?? [])
+          .map((e) => double.parse(e))
+          .toList();
+      downloadPoints = (prefs.getStringList('downloadPoints') ?? [])
+          .map((e) => double.parse(e))
+          .toList();
+      lastUpSession = uploadTotal;
+      lastDownSession = downloadTotal;
+    });
+  }
+
+  String formatBytes(int bytes) {
+    if (bytes < 1024) return "$bytes B";
+    if (bytes < 1024 * 1024) return "${(bytes / 1024).toStringAsFixed(1)} KB";
+    if (bytes < 1024 * 1024 * 1024) {
+      return "${(bytes / 1024 / 1024).toStringAsFixed(2)} MB";
+    }
+    return "${(bytes / 1024 / 1024 / 1024).toStringAsFixed(2)} GB";
+  }
+
+  Future<void> initCore() async {
+    addLog("Démarrage du core...");
+    await v2ray.initializeV2Ray();
+    try {
+      final version = await v2ray.getCoreVersion();
+      addLog("Core prêt - Xray $version");
+    } catch (e) {
+      addLog("Erreur core: $e");
+    }
+  }
+
+  Future<void> saveLockedConfig({
+    required String name,
+    required String mode,
+    required String host,
+    required String config,
+  }) async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.setBool('isLocked', true);
+    await prefs.setString('lockedName', name);
+    await prefs.setString('lockedMode', mode);
+    await prefs.setString('lockedHost', host);
+    await prefs.setString('lockedConfig', config);
+  }
+
+  Future<void> loadLockedConfig() async {
+    final prefs = await SharedPreferences.getInstance();
+    final locked = prefs.getBool('isLocked') ?? false;
+
+    if (locked) {
+      setState(() {
+        isLocked = true;
+        lockedName = prefs.getString('lockedName');
+        modeSelectionne = prefs.getString('lockedMode') ?? "VLESS / VMess";
+        lockedHost = prefs.getString('lockedHost');
+        lockedConfig = prefs.getString('lockedConfig');
+        hostCtrl.text = "*******";
+        configCtrl.text = "******** Configuration verrouillée ********";
+      });
+      addLog("Configuration verrouillée chargée");
+    }
+  }
+
+  void addLog(String msg) {
+    String safeMsg = msg;
+    if (lockedHost != null && lockedHost!.isNotEmpty) {
+      safeMsg = safeMsg.replaceAll(lockedHost!, "*******");
+    }
+    if (hostCtrl.text.isNotEmpty && hostCtrl.text != "*******") {
+      safeMsg = safeMsg.replaceAll(hostCtrl.text, "*******");
+    }
+
+    final time = DateTime.now().toString().substring(11, 19);
+    setState(() {
+      logs.add("[$time] $safeMsg");
+    });
+  }
+
+  String get notificationName {
+    String timeStr = estConnecte ? " • $connectionTime" : "";
+    switch (modeSelectionne) {
+      case "UDP":
+        return "XV2ray UDP connected$timeStr";
+      case "SlowDNS":
+        return "XV2ray SlowDNS connected$timeStr";
+      case "SSH":
+        return "XV2ray SSH connected$timeStr";
+      case "Trojan":
+        return "XV2ray Trojan connected$timeStr";
+      default:
+        return "XV2ray VLESS connected$timeStr";
+    }
+  }
+
+  String? buildFinalConfig(String raw, String host) {
+    try {
+      if (raw.trim().startsWith("{")) {
+        addLog("JSON détecté");
+        return raw.trim();
+      }
+
+      if (!raw.startsWith("vless://") &&
+          !raw.startsWith("vmess://") &&
+          !raw.startsWith("trojan://")) {
+        return null;
+      }
+
+      addLog("Transformation du lien...");
+      final parser = FlutterV2ray.parseFromURL(raw.trim());
+      final full = parser.getFullConfiguration();
+      final Map<String, dynamic> json = jsonDecode(full);
+
+      if (host.isNotEmpty &&
+          json["outbounds"] != null &&
+          json["outbounds"].isNotEmpty) {
+        final outbound = json["outbounds"][0];
+        final stream = outbound["streamSettings"] ?? {};
+        final network = stream["network"] ?? "ws";
+
+        if (network == "ws") {
+          stream["wsSettings"] ??= {};
+          stream["wsSettings"]["headers"] ??= {};
+          stream["wsSettings"]["headers"]["Host"] = host;
+          addLog("Host injecté: *******");
+        } else if (network == "http" || network == "h2") {
+          stream["httpSettings"] ??= {};
+          stream["httpSettings"]["host"] = [host];
+          addLog("Host HTTP injecté: *******");
+        }
+        outbound["streamSettings"] = stream;
+      }
+
+      return jsonEncode(json);
+    } catch (e) {
+      addLog("Erreur: $e");
+      return null;
+    }
+  }
+
+  Future<void> toggle() async {
+    if (estConnecte || enCours) {
+      addLog("Déconnexion...");
+      await v2ray.stopV2Ray();
+      setState(() {
+        estConnecte = false;
+        enCours = false;
+        statut = "DÉCONNECTÉ";
+      });
+      addLog("Déconnecté - Conso: ${formatBytes(uploadTotal + downloadTotal)}");
+      return;
+    }
+
+    final raw = isLocked ? (lockedConfig ?? "") : configCtrl.text.trim();
+    final host = isLocked ? (lockedHost ?? "") : hostCtrl.text.trim();
+
+    if (raw.isEmpty) {
+      addLog("Aucune configuration");
+      showCustomSnack("Aucune configuration disponible", const Color(0xFFEF4444));
+      return;
+    }
+
+    if (modeSelectionne == "UDP" ||
+        modeSelectionne == "SlowDNS" ||
+        modeSelectionne == "SSH") {
+      addLog("Mode $modeSelectionne pas encore disponible");
+      setState(() => statut = "MODE BIENTÔT DISPO");
+      return;
+    }
+
+    final config = buildFinalConfig(raw, host);
+    if (config == null) {
+      setState(() => statut = "CONFIG INVALIDE");
+      addLog("Configuration invalide");
+      return;
+    }
+
+    setState(() {
+      enCours = true;
+      statut = "CONNEXION...";
+    });
+
+    addLog("Mode: $modeSelectionne");
+    addLog("Demande permission VPN...");
+
+    try {
+      final ok = await v2ray.requestPermission();
+      if (!ok) {
+        addLog("Permission refusée");
+        setState(() {
+          enCours = false;
+          statut = "PERMISSION REFUSÉE";
+        });
+        return;
+      }
+
+      addLog("Lancement du tunnel...");
+      await v2ray.startV2Ray(
+        remark: notificationName,
+        config: config,
+        blockedApps: [],
+      );
+    } catch (e) {
+      addLog("Échec: $e");
+      setState(() {
+        enCours = false;
+        statut = "ÉCHEC";
+      });
+    }
+  }
+
+  Future<void> importConfig() async {
+    final TextEditingController linkCtrl = TextEditingController();
+
+    final result = await showDialog<String>(
+      context: context,
+      builder: (context) {
+        return AlertDialog(
+          backgroundColor: const Color(0xFF1E293B),
+          title: const Text("Importer une configuration"),
+          content: TextField(
+            controller: linkCtrl,
+            maxLines: 5,
+            style: const TextStyle(color: Colors.white),
+            decoration: const InputDecoration(
+              hintText: "Colle ici le lien xv2ray://...",
+              hintStyle: TextStyle(color: Colors.white38),
+              border: OutlineInputBorder(),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.pop(context),
+              child: const Text("Annuler"),
+            ),
+            ElevatedButton(
+              onPressed: () => Navigator.pop(context, linkCtrl.text.trim()),
+              style: ElevatedButton.styleFrom(
+                backgroundColor: const Color(0xFF0EA5E9),
+                foregroundColor: Colors.white,
+              ),
+              child: const Text("Importer"),
+            ),
+          ],
+        );
+      },
+    );
+
+    if (result == null || result.isEmpty) {
+      addLog("Import annulé");
+      return;
+    }
+
+    try {
+      String content = result;
+
+      if (content.startsWith("xv2ray://config/")) {
+        content = content.replaceFirst("xv2ray://config/", "");
+        content = _deobfuscate(content);
+      }
+
+      bool wasLocked = false;
+      if (content.startsWith("XV2RAY_LOCKED:")) {
+        wasLocked = true;
+        content = utf8.decode(
+            base64.decode(content.replaceFirst("XV2RAY_LOCKED:", "")));
+      }
+
+      final map = jsonDecode(content);
+
+      if (map["app"] != "XV2ray") {
+        showCustomSnack("Lien non compatible", const Color(0xFFEF4444));
+        return;
+      }
+
+      if (map["expire_date"] != null) {
+        final expire = DateTime.tryParse(map["expire_date"]);
+        if (expire != null && DateTime.now().isAfter(expire)) {
+          showCustomSnack(
+              "Cette configuration a expiré", const Color(0xFFEF4444));
+          return;
+        }
+      }
+
+      final name = map["name"] ?? "Configuration";
+      final mode = map["mode"] ?? "VLESS / VMess";
+      final host = map["host"] ?? "";
+      final config = map["config"] ?? "";
+      final locked = map["locked"] == true || wasLocked;
+
+      if (locked) {
+        await saveLockedConfig(
+          name: name,
+          mode: mode,
+          host: host,
+          config: config,
+        );
+
+        setState(() {
+          isLocked = true;
+          lockedName = name;
+          lockedHost = host;
+          lockedConfig = config;
+          modeSelectionne = mode;
+          hostCtrl.text = "*******";
+          configCtrl.text = "******** Configuration verrouillée ********";
+        });
+
+        addLog("Configuration verrouillée importée");
+      } else {
+        setState(() {
+          isLocked = false;
+          modeSelectionne = mode;
+          hostCtrl.text = host;
+          configCtrl.text = config;
+        });
+        addLog("Configuration importée");
+      }
+
+      showCustomSnack(
+        locked
+            ? "Config verrouillée importée : $name"
+            : "Importé : $name",
+        const Color(0xFF22C55E),
+      );
+    } catch (e) {
+      addLog("Erreur import : $e");
+      showCustomSnack("Lien invalide", const Color(0xFFEF4444));
+    }
+  }
+
+  Future<void> cleanConfig() async {
+    if (!isLocked) {
+      showCustomSnack(
+          "Aucune configuration verrouillée à effacer", const Color(0xFFEF4444));
+      return;
+    }
+
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (context) => AlertDialog(
+        backgroundColor: const Color(0xFF1E293B),
+        title: const Text("Effacer la configuration"),
+        content: Text(
+          "Supprimer définitivement la configuration \"${lockedName ?? 'verrouillée'}\"?\n\nL'app redeviendra vierge.",
+          style: const TextStyle(color: Colors.white70),
+        ),
+        actions: [
+          TextButton(
+            onPressed: () => Navigator.pop(context, false),
+            child: const Text("Annuler"),
+          ),
+          ElevatedButton(
+            onPressed: () => Navigator.pop(context, true),
+            style: ElevatedButton.styleFrom(
+              backgroundColor: const Color(0xFFEF4444),
+              foregroundColor: Colors.white,
+            ),
+            child: const Text("Effacer"),
+          ),
+        ],
+      ),
+    );
+
+    if (confirm != true) return;
+
+    if (estConnecte || enCours) {
+      await v2ray.stopV2Ray();
+    }
+
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove('isLocked');
+    await prefs.remove('lockedName');
+    await prefs.remove('lockedMode');
+    await prefs.remove('lockedHost');
+    await prefs.remove('lockedConfig');
+
+    setState(() {
+      isLocked = false;
+      lockedHost = null;
+      lockedConfig = null;
+      lockedName = null;
+      hostCtrl.clear();
+      configCtrl.clear();
+      modeSelectionne = "VLESS / VMess";
+      statut = "DÉCONNECTÉ";
+      estConnecte = false;
+      enCours = false;
+      logs.clear();
+    });
+
+    addLog("App réinitialisée - configuration supprimée");
+    showCustomSnack(
+        "Configuration effacée. Conso conservée.", const Color(0xFFEF4444));
+  }
+
+  void exportConfig() {
+    if (isLocked) return;
+    Navigator.push(
+      context,
+      MaterialPageRoute(
+        builder: (_) => ExportPage(
+          mode: modeSelectionne,
+          host: hostCtrl.text,
+          config: configCtrl.text,
+        ),
+      ),
+    );
+  }
+
+  Color get couleur {
+    if (estConnecte) return const Color(0xFF22C55E);
+    if (enCours) return const Color(0xFFF59E0B);
+    if (statut.contains("INVALIDE") || statut.contains("ÉCHEC")) {
+      return const Color(0xFF6B7280);
+    }
+    return const Color(0xFFEF4444);
+  }
+
+  @override
+  void dispose() {
+    hostCtrl.dispose();
+    configCtrl.dispose();
+    _pulseController.dispose();
+    _rotateController.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      extendBodyBehindAppBar: true,
+      appBar: AppBar(
+        title: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            // Logo bouclier bleu électrique
+            Container(
+              width: 32,
+              height: 32,
+              decoration: BoxDecoration(
+                shape: BoxShape.circle,
+                gradient: const LinearGradient(
+                  begin: Alignment.topLeft,
+                  end: Alignment.bottomRight,
+                  colors: [Color(0xFF00D4FF), Color(0xFF0066FF)],
+                ),
+                boxShadow: [
+                  BoxShadow(
+                    color: const Color(0xFF00D4FF).withOpacity(0.5),
+                    blurRadius: 8,
+                    spreadRadius: 1,
+                  ),
+                ],
+              ),
+              child: const Icon(
+                Icons.shield_rounded,
+                color: Colors.white,
+                size: 20,
+              ),
+            ),
+            const SizedBox(width: 10),
+            ShaderMask(
+              shaderCallback: (bounds) => const LinearGradient(
+                colors: [Color(0xFF00D4FF), Color(0xFF0EA5E9)],
+              ).createShader(bounds),
+              child: const Text(
+                "XV2ray",
+                style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    color: Colors.white,
+                    fontSize: 22),
+              ),
+            ),
+          ],
+        ),
+        centerTitle: true,
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        actions: [
+          IconButton(
+            icon: const Icon(Icons.article_outlined, color: Colors.white),
+            onPressed: () {
+              Navigator.push(
+                context,
+                MaterialPageRoute(builder: (_) => LogsScreen(logs: logs)),
+              );
+            },
+          ),
+          PopupMenuButton<String>(
+            icon: const Icon(Icons.more_vert, color: Colors.white),
+            color: const Color(0xFF1E293B),
+            onSelected: (value) {
+              if (value == 'import') importConfig();
+              if (value == 'export') exportConfig();
+              if (value == 'clean') cleanConfig();
+            },
+            itemBuilder: (context) => [
+              const PopupMenuItem(
+                value: 'import',
+                child: Row(
+                  children: [
+                    Icon(Icons.download_rounded,
+                        size: 20, color: Color(0xFF0EA5E9)),
+                    SizedBox(width: 12),
+                    Text('Import', style: TextStyle(color: Colors.white)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'export',
+                enabled: !isLocked,
+                child: Row(
+                  children: [
+                    Icon(Icons.link,
+                        size: 20,
+                        color: isLocked ? Colors.grey : const Color(0xFF22C55E)),
+                    const SizedBox(width: 12),
+                    Text('Export',
+                        style: TextStyle(
+                            color: isLocked ? Colors.grey : Colors.white)),
+                  ],
+                ),
+              ),
+              PopupMenuItem(
+                value: 'clean',
+                enabled: isLocked,
+                child: Row(
+                  children: [
+                    Icon(Icons.delete_forever_rounded,
+                        size: 20,
+                        color: isLocked
+                            ? const Color(0xFFEF4444)
+                            : Colors.grey),
+                    const SizedBox(width: 12),
+                    Text('Clean',
+                        style: TextStyle(
+                            color: isLocked ? Colors.white : Colors.grey)),
+                  ],
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              Color(0xFF0B1120),
+              Color(0xFF1E293B),
+              Color(0xFF0F172A),
+            ],
+          ),
+        ),
+        child: SafeArea(
+          child: SingleChildScrollView(
+            padding: const EdgeInsets.all(16),
+            child: Column(
+              children: [
+                const SizedBox(height: 8),
+                _buildGlassCard(
+                  child: Column(
+                    children: [
+                      const Text(
+                        "Sélectionne le mode",
+                        style: TextStyle(color: Colors.white60, fontSize: 12),
+                      ),
+                      const SizedBox(height: 8),
+                      DropdownButton<String>(
+                        value: modeSelectionne,
+                        isExpanded: true,
+                        dropdownColor: const Color(0xFF1E293B),
+                        underline: const SizedBox(),
+                        style:
+                            const TextStyle(color: Colors.white, fontSize: 15),
+                        items: modes
+                            .map((m) =>
+                                DropdownMenuItem(value: m, child: Text(m)))
+                            .toList(),
+                        onChanged: isLocked
+                            ? null
+                            : (value) {
+                                if (value != null) {
+                                  setState(() => modeSelectionne = value);
+                                  addLog("Mode changé → $value");
+                                }
+                              },
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                _buildGlassCard(
+                  child: Column(
+                    children: [
+                      Text(
+                        statut,
+                        style: TextStyle(
+                          color: couleur,
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                          letterSpacing: 1.2,
+                        ),
+                      ),
+                      if (estConnecte)
+                        Padding(
+                          padding: const EdgeInsets.only(top: 6),
+                          child: Text(
+                            connectionTime,
+                            style: const TextStyle(
+                                color: Colors.white54, fontSize: 13),
+                          ),
+                        ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 12),
+                _buildGlassCard(
+                  child: Column(
+                    children: [
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          _buildSpeedBadge(Icons.arrow_upward, currentUpSpeed,
+                              Colors.blue.shade400),
+                          Column(
+                            children: [
+                              const Text(
+                                "TOTAL",
+                                style: TextStyle(
+                                    fontSize: 10,
+                                    color: Colors.white38,
+                                    letterSpacing: 1),
+                              ),
+                              const SizedBox(height: 2),
+                              Text(
+                                formatBytes(uploadTotal + downloadTotal),
+                                style: const TextStyle(
+                                    fontSize: 16,
+                                    color: Colors.white,
+                                    fontWeight: FontWeight.bold),
+                              ),
+                            ],
+                          ),
+                          _buildSpeedBadge(Icons.arrow_downward,
+                              currentDownSpeed, const Color(0xFF22C55E)),
+                        ],
+                      ),
+                      const SizedBox(height: 12),
+                      SizedBox(
+                        height: 80,
+                        child: CustomPaint(
+                          painter: ConsumptionGraphPainter(
+                            uploadPoints: uploadPoints,
+                            downloadPoints: downloadPoints,
+                          ),
+                          size: Size.infinite,
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 24),
+                AnimatedBuilder(
+                  animation: _pulseAnimation,
+                  builder: (context, child) {
+                    return Transform.scale(
+                      scale: estConnecte ? _pulseAnimation.value : 1.0,
+                      child: GestureDetector(
+                        onTap: enCours ? null : toggle,
+                        child: AnimatedBuilder(
+                          animation: _rotateController,
+                          builder: (context, child) {
+                            return Transform.rotate(
+                              angle: enCours
+                                  ? _rotateController.value * 2 * pi
+                                  : 0,
+                              child: Container(
+                                width: 160,
+                                height: 160,
+                                decoration: BoxDecoration(
+                                  shape: BoxShape.circle,
+                                  gradient: RadialGradient(
+                                    colors: [
+                                      couleur.withOpacity(0.3),
+                                      couleur.withOpacity(0.1),
+                                      Colors.transparent,
+                                    ],
+                                  ),
+                                  boxShadow: [
+                                    BoxShadow(
+                                      color: couleur.withOpacity(0.4),
+                                      blurRadius: 30,
+                                      spreadRadius: 5,
+                                    ),
+                                  ],
+                                ),
+                                child: Center(
+                                  child: Container(
+                                    width: 140,
+                                    height: 140,
+                                    decoration: BoxDecoration(
+                                      shape: BoxShape.circle,
+                                      color: const Color(0xFF1E293B),
+                                      border:
+                                          Border.all(color: couleur, width: 3),
+                                      boxShadow: [
+                                        BoxShadow(
+                                          color: Colors.black.withOpacity(0.3),
+                                          blurRadius: 10,
+                                          offset: const Offset(0, 4),
+                                        ),
+                                      ],
+                                    ),
+                                    child: Icon(
+                                      enCours
+                                          ? Icons.sync
+                                          : Icons.power_settings_new_rounded,
+                                      size: 60,
+                                      color: couleur,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                            );
+                          },
+                        ),
+                      ),
+                    );
+                  },
+                ),
+                const SizedBox(height: 24),
+                _buildGlassCard(
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.start,
+                    children: [
+                      const Text(
+                        "HOST",
+                        style: TextStyle(
+                            color: Colors.white38,
+                            fontSize: 11,
+                            letterSpacing: 1),
+                      ),
+                      const SizedBox(height: 6),
+                      TextField(
+                        controller: hostCtrl,
+                        enabled: !isLocked,
+                        obscureText: isLocked,
+                        style: const TextStyle(color: Colors.white),
+                        decoration: InputDecoration(
+                          hintText: "Exemple: www.google.com",
+                          hintStyle: const TextStyle(color: Colors.white24),
+                          filled: true,
+                          fillColor: isLocked
+                              ? Colors.white.withOpacity(0.05)
+                              : Colors.white.withOpacity(0.1),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide.none,
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide:
+                                BorderSide(color: Colors.white.withOpacity(0.1)),
+                          ),
+                        ),
+                      ),
+                      const SizedBox(height: 16),
+                      const Text(
+                        "CONFIGURATION",
+                        style: TextStyle(
+                            color: Colors.white38,
+                            fontSize: 11,
+                            letterSpacing: 1),
+                      ),
+                      const SizedBox(height: 6),
+                      TextField(
+                        controller: configCtrl,
+                        enabled: !isLocked,
+                        maxLines: 3,
+                        style: const TextStyle(
+                            fontSize: 12,
+                            fontFamily: 'monospace',
+                            color: Colors.white),
+                        decoration: InputDecoration(
+                          hintText: "vless:// ou vmess:// ou JSON",
+                          hintStyle: const TextStyle(color: Colors.white24),
+                          filled: true,
+                          fillColor: isLocked
+                              ? Colors.white.withOpacity(0.05)
+                              : Colors.white.withOpacity(0.1),
+                          border: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide: BorderSide.none,
+                          ),
+                          enabledBorder: OutlineInputBorder(
+                            borderRadius: BorderRadius.circular(12),
+                            borderSide:
+                                BorderSide(color: Colors.white.withOpacity(0.1)),
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                const SizedBox(height: 20),
+                const Text(
+                  "XV2ray • Powered by Xray",
+                  style: TextStyle(color: Colors.white24, fontSize: 11),
+                ),
+                const SizedBox(height: 20),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildGlassCard({required Widget child}) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: Colors.white.withOpacity(0.05),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: Colors.white.withOpacity(0.1)),
+        boxShadow: [
+          BoxShadow(
+            color: Colors.black.withOpacity(0.2),
+            blurRadius: 10,
+            offset: const Offset(0, 4),
+          ),
+        ],
+      ),
+      child: child,
+    );
+  }
+
+  Widget _buildSpeedBadge(IconData icon, double speed, Color color) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 6),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.15),
+        borderRadius: BorderRadius.circular(20),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Icon(icon, size: 14, color: color),
+          const SizedBox(width: 4),
+          Text(
+            "${speed.toStringAsFixed(1)} KB/s",
+            style: TextStyle(
+                fontSize: 12, color: color, fontWeight: FontWeight.w600),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// PAINTER POUR LE GRAPHE
+class ConsumptionGraphPainter extends CustomPainter {
+  final List<double> uploadPoints;
+  final List<double> downloadPoints;
+
+  ConsumptionGraphPainter({
+    required this.uploadPoints,
+    required this.downloadPoints,
+  });
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    if (uploadPoints.isEmpty && downloadPoints.isEmpty) return;
+
+    final allPoints = [...uploadPoints, ...downloadPoints];
+    final maxVal = allPoints.reduce((a, b) => a > b ? a : b);
+    final normalizedMax = maxVal == 0 ? 1 : maxVal * 1.2;
+
+    final gridPaint = Paint()
+      ..color = Colors.white.withOpacity(0.05)
+      ..strokeWidth = 1;
+    for (int i = 1; i < 4; i++) {
+      final y = size.height * i / 4;
+      canvas.drawLine(Offset(0, y), Offset(size.width, y), gridPaint);
+    }
+
+    void drawLine(List<double> points, Color color) {
+      if (points.isEmpty) return;
+      final paint = Paint()
+        ..color = color
+        ..strokeWidth = 2.5
+        ..style = PaintingStyle.stroke
+        ..strokeCap = StrokeCap.round;
+
+      final fillPaint = Paint()
+        ..shader = LinearGradient(
+          begin: Alignment.topCenter,
+          end: Alignment.bottomCenter,
+          colors: [color.withOpacity(0.3), color.withOpacity(0.0)],
+        ).createShader(Rect.fromLTWH(0, 0, size.width, size.height))
+        ..style = PaintingStyle.fill;
+
+      final path = Path();
+      final fillPath = Path();
+      final stepX = size.width / (maxGraphPoints - 1);
+
+      for (int i = 0; i < points.length; i++) {
+        final x = i * stepX;
+        final y = size.height - (points[i] / normalizedMax * size.height);
+        if (i == 0) {
+          path.moveTo(x, y);
+          fillPath.moveTo(x, size.height);
+          fillPath.lineTo(x, y);
+        } else {
+          path.lineTo(x, y);
+          fillPath.lineTo(x, y);
+        }
+      }
+
+      fillPath.lineTo((points.length - 1) * stepX, size.height);
+      fillPath.close();
+
+      canvas.drawPath(fillPath, fillPaint);
+      canvas.drawPath(path, paint);
+    }
+
+    drawLine(downloadPoints, const Color(0xFF22C55E));
+    drawLine(uploadPoints, Colors.blue.shade400);
+  }
+
+  @override
+  bool shouldRepaint(ConsumptionGraphPainter oldDelegate) {
+    return oldDelegate.uploadPoints != uploadPoints ||
+        oldDelegate.downloadPoints != downloadPoints;
+  }
+
+  static const int maxGraphPoints = 60;
+}
+
+// ==================== PAGE EXPORT ====================
+class ExportPage extends StatefulWidget {
+  final String mode;
+  final String host;
+  final String config;
+
+  const ExportPage({
+    super.key,
+    required this.mode,
+    required this.host,
+    required this.config,
+  });
+
+  @override
+  State<ExportPage> createState() => _ExportPageState();
+}
+
+class _ExportPageState extends State<ExportPage> {
+  final nameCtrl = TextEditingController();
+  bool lockConfig = true;
+  bool hasExpire = false;
+  DateTime? expireDate;
+  String? generatedLink;
+
+  void generateLink() {
+    if (nameCtrl.text.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text("Mets un nom à la configuration")),
+      );
+      return;
+    }
+
+    final data = {
+      "app": "XV2ray",
+      "name": nameCtrl.text.trim(),
+      "mode": widget.mode,
+      "host": widget.host,
+      "config": widget.config,
+      "locked": lockConfig,
+      "expire_date": hasExpire && expireDate != null
+          ? expireDate!.toIso8601String()
+          : null,
+      "created_at": DateTime.now().toIso8601String(),
+    };
+
+    String content = jsonEncode(data);
+
+    if (lockConfig) {
+      content = "XV2RAY_LOCKED:${base64.encode(utf8.encode(content))}";
+    }
+
+    final protected = _obfuscate(content);
+    final link = "xv2ray://config/$protected";
+
+    setState(() {
+      generatedLink = link;
+    });
+
+    Clipboard.setData(ClipboardData(text: link));
+
+    ScaffoldMessenger.of(context).hideCurrentSnackBar();
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Row(
+          children: [
+            const Icon(Icons.check_circle, color: Color(0xFF22C55E), size: 20),
+            const SizedBox(width: 12),
+            const Expanded(
+              child: Text(
+                "Lien protégé copié !",
+                style: TextStyle(fontSize: 14, fontWeight: FontWeight.w500),
+              ),
+            ),
+          ],
+        ),
+        backgroundColor: const Color(0xFF1E293B),
+        behavior: SnackBarBehavior.floating,
+        margin: const EdgeInsets.all(16),
+        duration: const Duration(seconds: 2),
+        shape: RoundedRectangleBorder(
+          borderRadius: BorderRadius.circular(12),
+          side: BorderSide(
+              color: const Color(0xFF22C55E).withOpacity(0.3), width: 1),
+        ),
+      ),
+    );
+  }
+
+  @override
+  void dispose() {
+    nameCtrl.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0B1120),
+      appBar: AppBar(
+        title: const Text("Exporter en Lien",
+            style: TextStyle(color: Colors.white)),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              Color(0xFF0B1120),
+              Color(0xFF1E293B),
+              Color(0xFF0F172A),
+            ],
+          ),
+        ),
+        child: SingleChildScrollView(
+          padding: const EdgeInsets.all(20),
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              const Text(
+                "Nom de la configuration",
+                style:
+                    TextStyle(fontWeight: FontWeight.w600, color: Colors.white),
+              ),
+              const SizedBox(height: 8),
+              TextField(
+                controller: nameCtrl,
+                style: const TextStyle(color: Colors.white),
+                decoration: InputDecoration(
+                  hintText: "Ex: Serveur MTN Cameroun",
+                  hintStyle: const TextStyle(color: Colors.white38),
+                  filled: true,
+                  fillColor: Colors.white.withOpacity(0.05),
+                  border: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide:
+                        BorderSide(color: Colors.white.withOpacity(0.1)),
+                  ),
+                  enabledBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide:
+                        BorderSide(color: Colors.white.withOpacity(0.1)),
+                  ),
+                  focusedBorder: OutlineInputBorder(
+                    borderRadius: BorderRadius.circular(12),
+                    borderSide: const BorderSide(color: Color(0xFF0EA5E9)),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 20),
+              Container(
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.05),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: Colors.white.withOpacity(0.1)),
+                ),
+                child: SwitchListTile(
+                  title: const Text("Lock config",
+                      style: TextStyle(color: Colors.white)),
+                  subtitle: const Text(
+                      "Configuration verrouillée (recommandé)",
+                      style: TextStyle(color: Colors.white60)),
+                  value: lockConfig,
+                  activeColor: const Color(0xFF0EA5E9),
+                  onChanged: (v) => setState(() => lockConfig = v),
+                ),
+              ),
+              const SizedBox(height: 12),
+              Container(
+                decoration: BoxDecoration(
+                  color: Colors.white.withOpacity(0.05),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: Colors.white.withOpacity(0.1)),
+                ),
+                child: Column(
+                  children: [
+                    SwitchListTile(
+                      title: const Text("Date d'expiration",
+                          style: TextStyle(color: Colors.white)),
+                      value: hasExpire,
+                      activeColor: const Color(0xFF0EA5E9),
+                      onChanged: (v) => setState(() => hasExpire = v),
+                    ),
+                    if (hasExpire)
+                      ListTile(
+                        title: Text(
+                          expireDate == null
+                              ? "Choisir une date"
+                              : "Expire le : ${expireDate!.day}/${expireDate!.month}/${expireDate!.year}",
+                          style: const TextStyle(color: Colors.white),
+                        ),
+                        trailing: const Icon(Icons.calendar_today,
+                            color: Colors.white70),
+                        onTap: () async {
+                          final picked = await showDatePicker(
+                            context: context,
+                            initialDate:
+                                DateTime.now().add(const Duration(days: 30)),
+                            firstDate: DateTime.now(),
+                            lastDate: DateTime(2035),
+                            builder: (context, child) {
+                              return Theme(
+                                data: Theme.of(context).copyWith(
+                                  colorScheme: const ColorScheme.dark(
+                                    primary: Color(0xFF0EA5E9),
+                                    surface: Color(0xFF1E293B),
+                                  ),
+                                ),
+                                child: child!,
+                              );
+                            },
+                          );
+                          if (picked != null) {
+                            setState(() => expireDate = picked);
+                          }
+                        },
+                      ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 24),
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: generateLink,
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF22C55E),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 16),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(12),
+                    ),
+                    elevation: 8,
+                    shadowColor: const Color(0xFF22C55E).withOpacity(0.4),
+                  ),
+                  child: const Text(
+                    "Générer le lien protégé",
+                    style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+                  ),
+                ),
+              ),
+              if (generatedLink != null) ...[
+                const SizedBox(height: 20),
+                const Text("Lien généré :",
+                    style: TextStyle(
+                        fontWeight: FontWeight.bold, color: Colors.white)),
+                const SizedBox(height: 8),
+                Container(
+                  width: double.infinity,
+                  padding: const EdgeInsets.all(12),
+                  decoration: BoxDecoration(
+                    color: Colors.white.withOpacity(0.05),
+                    borderRadius: BorderRadius.circular(12),
+                    border: Border.all(color: Colors.white.withOpacity(0.1)),
+                  ),
+                  child: SelectableText(
+                    generatedLink!,
+                    style: const TextStyle(fontSize: 12, color: Colors.white70),
+                  ),
+                ),
+              ],
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+// ==================== PAGE LOGS ====================
+class LogsScreen extends StatelessWidget {
+  final List<String> logs;
+  const LogsScreen({super.key, required this.logs});
+
+  Color _getLogColor(String log) {
+    if (log.contains("ready to use") || log.contains("Import")) {
+      return const Color(0xFF22C55E);
+    }
+    if (log.contains("Erreur") ||
+        log.contains("Échec") ||
+        log.contains("expiré")) {
+      return const Color(0xFFEF4444);
+    }
+    if (log.contains("CONNECTING") || log.contains("CONNEXION")) {
+      return const Color(0xFFF59E0B);
+    }
+    return Colors.white70;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF0B1120),
+      appBar: AppBar(
+        title: const Text("Logs", style: TextStyle(color: Colors.white)),
+        backgroundColor: Colors.transparent,
+        elevation: 0,
+        iconTheme: const IconThemeData(color: Colors.white),
+      ),
+      body: Container(
+        decoration: const BoxDecoration(
+          gradient: LinearGradient(
+            begin: Alignment.topLeft,
+            end: Alignment.bottomRight,
+            colors: [
+              Color(0xFF0B1120),
+              Color(0xFF1E293B),
+              Color(0xFF0F172A),
+            ],
+          ),
+        ),
+        child: logs.isEmpty
+            ? const Center(
+                child: Text("Aucun log pour le moment",
+                    style: TextStyle(color: Colors.white38)))
+            : ListView.separated(
+                padding: const EdgeInsets.all(16),
+                itemCount: logs.length,
+                separatorBuilder: (_, __) =>
+                    Divider(height: 1, color: Colors.white.withOpacity(0.05)),
+                itemBuilder: (_, i) {
+                  final log = logs[i];
+                  return Padding(
+                    padding: const EdgeInsets.symmetric(vertical: 10),
+                    child: Text(
+                      log,
+                      style: TextStyle(
+                        fontSize: 12,
+                        fontFamily: 'monospace',
+                        color: _getLogColor(log),
+                        fontWeight: log.contains("ready to use")
+                            ? FontWeight.bold
+                            : FontWeight.normal,
+                      ),
+                    ),
+                  );
+                },
+              ),
+      ),
+    );
+  }
+}
